@@ -365,10 +365,8 @@ static struct adf4350_platform_data *adf4350_parse_dt(struct device *dev)
 	int ret;
 
 	pdata = devm_kzalloc(dev, sizeof(*pdata), GFP_KERNEL);
-	if (!pdata) {
-		dev_err(dev, "could not allocate memory for platform data\n");
+	if (!pdata)
 		return NULL;
-	}
 
 	strncpy(&pdata->name[0], np->name, SPI_NAME_SIZE - 1);
 
@@ -544,6 +542,31 @@ static int adf4350_probe(struct spi_device *spi)
 
 	memset(st->regs_hw, 0xFF, sizeof(st->regs_hw));
 
+	if (gpio_is_valid(pdata->gpio_lock_detect)) {
+		int i;
+		ret = devm_gpio_request(&spi->dev, pdata->gpio_lock_detect,
+					indio_dev->name);
+		if (ret) {
+			dev_err(&spi->dev, "fail to request lock detect GPIO-%d",
+				pdata->gpio_lock_detect);
+			goto error_disable_reg;
+		}
+		gpio_direction_input(pdata->gpio_lock_detect);
+
+		/* ADF4350/1 are write only devices, try to probe it this way */
+		for (i = 0; i < 4; i++) {
+			st->regs[ADF4350_REG2] = ADF4350_REG2_MUXOUT((i & 1) ?
+				ADF4350_MUXOUT_DVDD : ADF4350_MUXOUT_GND);
+			adf4350_sync_config(st, false);
+			ret = gpio_get_value(st->pdata->gpio_lock_detect);
+			if (ret != ((i & 1) ? 1 : 0)) {
+				ret = -ENODEV;
+				dev_err(&spi->dev, "Probe failed (muxout)");
+				goto error_disable_reg;
+			}
+		}
+	}
+
 	st->regs[ADF4350_REG2] =
 		ADF4350_REG2_DOUBLE_BUFF_EN |
 		(pdata->ref_doubler_en ? ADF4350_REG2_RMULT2_EN : 0) |
@@ -573,18 +596,6 @@ static int adf4350_probe(struct spi_device *spi)
 
 	st->regs[ADF4350_REG5] = ADF4350_REG5_LD_PIN_MODE_DIGITAL |
 				BIT(19) | BIT(20);
-
-
-	if (gpio_is_valid(pdata->gpio_lock_detect)) {
-		ret = devm_gpio_request(&spi->dev, pdata->gpio_lock_detect,
-					indio_dev->name);
-		if (ret) {
-			dev_err(&spi->dev, "fail to request lock detect GPIO-%d",
-				pdata->gpio_lock_detect);
-			goto error_disable_reg;
-		}
-		gpio_direction_input(pdata->gpio_lock_detect);
-	}
 
 	if (pdata->power_up_frequency) {
 		ret = adf4350_set_freq(st, pdata->power_up_frequency);
@@ -622,9 +633,8 @@ static int adf4350_remove(struct spi_device *spi)
 	if (st->clk)
 		clk_disable_unprepare(st->clk);
 
-	if (!IS_ERR(reg)) {
+	if (!IS_ERR(reg))
 		regulator_disable(reg);
-	}
 
 	return 0;
 }

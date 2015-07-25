@@ -176,6 +176,7 @@ struct adv76xx_state {
 	struct v4l2_ctrl *analog_sampling_phase_ctrl;
 	struct v4l2_ctrl *free_run_color_manual_ctrl;
 	struct v4l2_ctrl *free_run_color_ctrl;
+	struct v4l2_ctrl *free_run_mode_ctrl;
 	struct v4l2_ctrl *rgb_quantization_range_ctrl;
 };
 
@@ -330,6 +331,11 @@ static const struct adv76xx_video_standards adv76xx_prim_mode_hdmi_gr[] = {
 	{ V4L2_DV_BT_DMT_1280X1024P60, 0x05, 0x00 },
 	{ V4L2_DV_BT_DMT_1280X1024P75, 0x06, 0x00 },
 	{ },
+};
+
+static const struct v4l2_event adv76xx_ev_fmt = {
+	.type = V4L2_EVENT_SOURCE_CHANGE,
+	.u.src_change.changes = V4L2_EVENT_SRC_CH_RESOLUTION,
 };
 
 /* ----------------------------------------------------------------------- */
@@ -1173,6 +1179,30 @@ static int adv76xx_s_ctrl(struct v4l2_ctrl *ctrl)
 		cp_write(sd, 0xc1, (ctrl->val & 0x00ff00) >> 8);
 		cp_write(sd, 0xc2, (u8)(ctrl->val & 0x0000ff));
 		return 0;
+	case V4L2_CID_ADV_RX_FREE_RUN_MODE:
+		switch (ctrl->val) {
+		case 0: /* Disabled */
+			/* Disable the free run feature in HDMI mode. */
+			cp_write_clr_set(sd, 0xba, 0x1, 0);
+			/* Do not force the CP core free run. */
+			cp_write_clr_set(sd, 0xbf, 0x1, 0);
+			break;
+		case 1: /* Enabled */
+			/* Enable the free run feature in HDMI mode. */
+			cp_write_clr_set(sd, 0xba, 0x1, 1);
+			/* Force the CP core to free run. */
+			cp_write_clr_set(sd, 0xbf, 0x1, 1);
+			break;
+		case 2: /* Automatic */
+			/* Enable the free run feature in HDMI mode. */
+			cp_write_clr_set(sd, 0xba, 0x1, 1);
+			/* Do not force the CP core free run. */
+			cp_write_clr_set(sd, 0xbf, 0x1, 0);
+			break;
+		default:
+			break;
+		}
+		return 0;
 	}
 	return -EINVAL;
 }
@@ -1730,10 +1760,10 @@ static int adv76xx_s_routing(struct v4l2_subdev *sd,
 	state->selected_input = input;
 
 	disable_input(sd);
-
 	select_input(sd);
-
 	enable_input(sd);
+
+	v4l2_subdev_notify_event(sd, &adv76xx_ev_fmt);
 
 	return 0;
 }
@@ -1879,6 +1909,7 @@ static int adv76xx_isr(struct v4l2_subdev *sd, u32 status, bool *handled)
 	const u8 irq_reg_0x70 = io_read(sd, 0x70);
 	u8 fmt_change_digital;
 	u8 fmt_change;
+	u8 hdmi_mode;
 	u8 tx_5v;
 
 	if (irq_reg_0x43)
@@ -1901,13 +1932,22 @@ static int adv76xx_isr(struct v4l2_subdev *sd, u32 status, bool *handled)
 			"%s: fmt_change = 0x%x, fmt_change_digital = 0x%x\n",
 			__func__, fmt_change, fmt_change_digital);
 
-		v4l2_subdev_notify(sd, ADV76XX_FMT_CHANGE, NULL);
+		v4l2_subdev_notify_event(sd, &adv76xx_ev_fmt);
 
 		if (handled)
 			*handled = true;
 	}
+
+	if (info->type == ADV7604) {
+		hdmi_mode = irq_reg_0x6b & 0x1;
+	} else {
+		hdmi_mode = io_read(sd, 0x66);
+		io_write(sd, 0x67, hdmi_mode);
+		hdmi_mode &= 0x08;
+	}
+
 	/* HDMI/DVI mode */
-	if (irq_reg_0x6b & 0x01) {
+	if (hdmi_mode) {
 		v4l2_dbg(1, debug, sd, "%s: irq %s mode\n", __func__,
 			(io_read(sd, 0x6a) & 0x01) ? "HDMI" : "DVI");
 		set_rgb_quantization_range(sd);
@@ -2288,6 +2328,18 @@ static int adv76xx_log_status(struct v4l2_subdev *sd)
 	return 0;
 }
 
+static int adv76xx_subscribe_event(struct v4l2_subdev *sd,
+	struct v4l2_fh *fh,	struct v4l2_event_subscription *sub)
+{
+	switch (sub->type) {
+		case V4L2_EVENT_CTRL:
+			return v4l2_ctrl_subdev_subscribe_event(sd, fh, sub);
+		case V4L2_EVENT_SOURCE_CHANGE:
+			return v4l2_src_change_event_subdev_subscribe(sd, fh, sub);
+	}
+	return -EINVAL;
+}
+
 /* ----------------------------------------------------------------------- */
 
 static const struct v4l2_ctrl_ops adv76xx_ctrl_ops = {
@@ -2301,6 +2353,8 @@ static const struct v4l2_subdev_core_ops adv76xx_core_ops = {
 	.g_register = adv76xx_g_register,
 	.s_register = adv76xx_s_register,
 #endif
+	.subscribe_event = adv76xx_subscribe_event,
+	.unsubscribe_event = v4l2_event_subdev_unsubscribe,
 };
 
 static const struct v4l2_subdev_video_ops adv76xx_video_ops = {
@@ -2360,6 +2414,23 @@ static const struct v4l2_ctrl_config adv76xx_ctrl_free_run_color = {
 	.max = 0xffffff,
 	.step = 0x1,
 	.def = 0x0,
+};
+
+static const char * const adv76xx_free_run_mode_strings[] = {
+	"Disabled",
+	"Enabled",
+	"Automatic",
+};
+
+static const struct v4l2_ctrl_config adv76xx_ctrl_free_run_mode = {
+	.ops = &adv76xx_ctrl_ops,
+	.id = V4L2_CID_ADV_RX_FREE_RUN_MODE,
+	.name = "Free Running Mode",
+	.type = V4L2_CTRL_TYPE_MENU,
+	.min = 0,
+	.max = ARRAY_SIZE(adv76xx_free_run_mode_strings) - 1,
+	.def = 2,
+	.qmenu = adv76xx_free_run_mode_strings,
 };
 
 /* ----------------------------------------------------------------------- */
@@ -2449,6 +2520,7 @@ static void adv7604_setup_irqs(struct v4l2_subdev *sd)
 static void adv7611_setup_irqs(struct v4l2_subdev *sd)
 {
 	io_write(sd, 0x41, 0xd0); /* STDI irq for any change, disable INT2 */
+	io_write(sd, 0x69, 0x08); /* HDMI mode interrupt */
 }
 
 static void adv76xx_unregister_clients(struct adv76xx_state *state)
@@ -2583,7 +2655,7 @@ static const struct adv76xx_chip_info adv76xx_chip_info[] = {
 		.lcf_reg = 0xa3,
 		.tdms_lock_mask = 0x43,
 		.cable_det_mask = 0x01,
-		.fmt_change_digital_mask = 0x03,
+		.fmt_change_digital_mask = 0x01,
 		.cp_csc = 0xf4,
 		.formats = adv7611_formats,
 		.nformats = ARRAY_SIZE(adv7611_formats),
@@ -2754,17 +2826,6 @@ static int adv76xx_probe(struct i2c_client *client,
 		return -ENODEV;
 	}
 
-	/* Request IRQ if available. */
-	if (client->irq) {
-		err = request_threaded_irq(client->irq, NULL, adv76xx_irq_handler,
-					   IRQF_TRIGGER_HIGH | IRQF_ONESHOT,
-					   KBUILD_MODNAME, state);
-		if (err < 0) {
-			v4l2_err(client, "Request interrupt error\n");
-			return err;
-		}
-	}
-
 	/* Request GPIOs. */
 	for (i = 0; i < state->info->num_dv_ports; ++i) {
 		state->hpd_gpio[i] =
@@ -2798,6 +2859,7 @@ static int adv76xx_probe(struct i2c_client *client,
 		id->name, i2c_adapter_id(client->adapter),
 		client->addr);
 	sd->flags |= V4L2_SUBDEV_FL_HAS_DEVNODE;
+	sd->flags |= V4L2_SUBDEV_FL_HAS_EVENTS;
 
 	/*
 	 * Verify that the chip is present. On ADV7604 the RD_INFO register only
@@ -2851,6 +2913,8 @@ static int adv76xx_probe(struct i2c_client *client,
 		v4l2_ctrl_new_custom(hdl, &adv76xx_ctrl_free_run_color_manual, NULL);
 	state->free_run_color_ctrl =
 		v4l2_ctrl_new_custom(hdl, &adv76xx_ctrl_free_run_color, NULL);
+	state->free_run_mode_ctrl =
+		v4l2_ctrl_new_custom(hdl, &adv76xx_ctrl_free_run_mode, NULL);
 
 	sd->ctrl_handler = hdl;
 	if (hdl->error) {
@@ -2911,12 +2975,26 @@ static int adv76xx_probe(struct i2c_client *client,
 	v4l2_info(sd, "%s found @ 0x%x (%s)\n", client->name,
 			client->addr << 1, client->adapter->name);
 
+	/* Request IRQ if available. */
+	if (client->irq) {
+		err = request_threaded_irq(client->irq, NULL, adv76xx_irq_handler,
+					   IRQF_TRIGGER_LOW | IRQF_ONESHOT,
+					   KBUILD_MODNAME, state);
+		if (err < 0) {
+			v4l2_err(client, "Request interrupt error\n");
+			goto err_entity;
+		}
+	}
+
 	err = v4l2_async_register_subdev(sd);
 	if (err)
-		goto err_entity;
+		goto err_free_irq;
 
 	return 0;
 
+err_free_irq:
+	if (client->irq)
+		free_irq(client->irq, state);
 err_entity:
 	media_entity_cleanup(&sd->entity);
 err_work_queues:

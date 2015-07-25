@@ -106,7 +106,7 @@
 #define AD9528_PLL1_REFA_DIFF_RCV_EN		BIT(5)
 #define AD9528_PLL1_REFB_RCV_EN			BIT(4)
 #define AD9528_PLL1_REFA_RCV_EN			BIT(3)
-#define AD9528_PLL1_REFA_REFB_PWR_CTRL_EN	BIT(2)
+#define AD9528_PLL1_VCXO_RCV_PD_EN		BIT(2)
 #define AD9528_PLL1_OSC_IN_CMOS_NEG_INP_EN	BIT(1)
 #define AD9528_PLL1_OSC_IN_DIFF_EN		BIT(0)
 
@@ -211,7 +211,7 @@
 
 #define AD9528_NUM_CHAN					14
 
-#define AD9528_SPI_MAGIC				0x0100FF05
+#define AD9528_SPI_MAGIC				0x00FF05
 
 /* Helpers to avoid excess line breaks */
 #define AD_IFE(_pde, _a, _b) ((pdata->_pde) ? _a : _b)
@@ -324,7 +324,7 @@ static int ad9528_write(struct iio_dev *indio_dev, unsigned addr, unsigned val)
 			AD9528_ADDR(addr));
 	st->data[1].d32 = cpu_to_be32(val);
 
-	dev_info(&indio_dev->dev, "Write 0x%x: 0x%x\n",
+	dev_dbg(&indio_dev->dev, "Write 0x%x: 0x%x\n",
 			AD9528_ADDR(addr) - AD9528_TRANSF_LEN(addr) + 1, val);
 
 	ret = spi_sync_transfer(st->spi, t, ARRAY_SIZE(t));
@@ -773,7 +773,7 @@ static int ad9528_setup(struct iio_dev *indio_dev)
 	if (ret < 0)
 		return ret;
 
-	if (ret != AD9528_SPI_MAGIC) {
+	if ((ret & 0xFFFFFF) != AD9528_SPI_MAGIC) {
 		dev_err(&indio_dev->dev,
 				"SPI Read Verify failed (0x%X)\n", ret);
 		return -EIO;
@@ -807,7 +807,7 @@ static int ad9528_setup(struct iio_dev *indio_dev)
 		return ret;
 
 	ret = ad9528_write(indio_dev, AD9528_PLL1_CTRL,
-		AD_IFE(pll1_bypass_en, AD9528_PLL1_REFA_REFB_PWR_CTRL_EN |
+		AD_IFE(pll1_bypass_en,
 		AD_IF(osc_in_diff_en, AD9528_PLL1_OSC_IN_DIFF_EN) |
 		AD_IF(osc_in_cmos_neg_inp_en,
 		      AD9528_PLL1_OSC_IN_CMOS_NEG_INP_EN) |
