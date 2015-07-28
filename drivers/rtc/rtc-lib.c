@@ -108,6 +108,14 @@ int rtc_valid_tm(struct rtc_time *tm)
 		|| ((unsigned)tm->tm_sec) >= 60)
 		return -EINVAL;
 
+	/* A date after 2038 Jan 19th does not fit in 32 bits
+	 * confusing the kernel and userspace.
+	 * Here we return invalid if the year is 2038
+	 * Inspired by: https://groups.google.com/forum/#!topic/rtc-linux/TAYvtsQU790
+	 */
+	if (tm->tm_year >= 138)
+		return -EINVAL;
+
 	return 0;
 }
 EXPORT_SYMBOL(rtc_valid_tm);
