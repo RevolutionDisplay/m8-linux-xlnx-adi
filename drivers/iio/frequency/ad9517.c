@@ -1,7 +1,7 @@
 /*
  * AD9517 SPI Clock Generator with integrated VCO
  *
- * Copyright 2013 Analog Devices Inc.
+ * Copyright 2013-2015 Analog Devices Inc.
  *
  * Licensed under the GPL-2.
  */
@@ -17,6 +17,8 @@
 #include <linux/io.h>
 #include <linux/firmware.h>
 #include <linux/of.h>
+
+#include <linux/gpio/consumer.h>
 
 #include <linux/clk.h>
 #include <linux/clkdev.h>
@@ -140,12 +142,8 @@ struct ad9517_platform_data {
 struct ad9517_outputs {
 	struct ad9517_state *st;
 	struct clk_hw hw;
-	unsigned long freq;
 	const char *parent_name;
-	bool is_enabled;
-	unsigned char pwrdwn_reg;
-	unsigned char pwrdwn_bit;
-
+	unsigned num;
 };
 
 struct ad9517_state {
@@ -155,8 +153,13 @@ struct ad9517_state {
 	struct clk_onecell_data clk_data;
 	unsigned long refin_freq;
 	unsigned long clkin_freq;
+	unsigned long div0123_freq;
+	unsigned long vco_divin_freq;
 	char *div0123_clk_parent_name;
 	char *vco_divin_clk_parent_name;
+
+	struct gpio_desc *gpio_reset;
+	struct gpio_desc *gpio_sync;
 };
 
 #define IS_FD				(1 << 7)
@@ -229,23 +232,22 @@ static int ad9517_write(struct spi_device *spi,
 }
 
 static int ad9517_parse_firmware(struct ad9517_state *st,
-				 char *data, unsigned size)
+				 const char *data, unsigned size)
 {
-	char *line;
-	int ret;
 	unsigned addr, val1, val2;
-	char *start_addr = data;
+	const char *line = data;
+	int ret;
 
-	while ((line = strsep(&data, "\n"))) {
-		if (line >= start_addr + size)
-			break;
-
+	while (line) {
 		ret = sscanf(line, "\"%x\",\"%x\",\"%x\"", &addr, &val1, &val2);
 		if (ret == 3) {
 			if (addr > AD9517_TRANSFER)
 				return -EINVAL;
 			st->regs[addr] = val2 & 0xFF;
 		}
+		line = strchr(line, '\n');
+		if (line != NULL)
+		    line++;
 	}
 	return 0;
 }
@@ -268,15 +270,280 @@ static int ad9517_parse_pdata(struct ad9517_state *st,
 	return 0;
 }
 
+static int ad9517_calc_divider_hi_lo(unsigned ratio, unsigned *hi, unsigned *lo)
+{
+
+	if (ratio < 2 || ratio > 32)
+		return -EINVAL;
+
+	*hi = ratio / 2 - 1;
+	*lo = *hi + (ratio % 2);
+
+	return 0;
+}
+
+static int ad9517_calc_d12_dividers(unsigned vco, unsigned out,  unsigned *d1_val, unsigned *d2_val)
+{
+	unsigned d1, d2, _d2, _d1, ratio;
+	unsigned err, min = UINT_MAX;
+
+	ratio = DIV_ROUND_CLOSEST(vco, out);
+	ratio = clamp_t(unsigned, ratio, 1, 32 * 32);
+
+	if (ratio == 1) {
+		*d1_val = 1;
+		*d2_val = 1; /* Bypass */
+		return 0;
+	}
+
+	if (ratio <= 32) {
+		*d1_val = ratio;
+		*d2_val = 1; /* Bypass */
+		return 0;
+	}
+
+	for (d1 = 1; d1 <= 32; d1++) {
+		d2 = DIV_ROUND_CLOSEST(ratio, d1);
+
+		if (d2 > 32 || !d2)
+			continue;
+
+		err = abs(out - vco / (d1 * d2));
+		if (err < min) {
+			_d1 = d1;
+			_d2 = d2;
+			min = err;
+		}
+
+		if (err == 0)
+			break;
+	}
+
+	*d2_val = min(_d2, _d1);
+	*d1_val = max(_d2, _d1);
+
+   return 0;
+}
+
+static int ad9517_out4567_set_frequency(struct ad9517_state *st, int chan, int val)
+{
+	unsigned reg_bypass, reg_div1, reg_div2;
+	unsigned d1, d2, hi, lo;
+	int ret;
+
+	switch (chan) {
+	case 4:
+	case 5:
+		reg_bypass = AD9517_CMOSDIV2_BYPASS;
+		reg_div1 = AD9517_CMOSDIV2_1;
+		reg_div2 = AD9517_CMOSDIV2_2;
+		break;
+	case 6:
+	case 7:
+		reg_bypass = AD9517_CMOSDIV3_BYPASS;
+		reg_div1 = AD9517_CMOSDIV3_1;
+		reg_div2 = AD9517_CMOSDIV3_2;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	ad9517_calc_d12_dividers(st->div0123_freq, val, &d1, &d2);
+
+	if (d1 == 1)
+		st->regs[reg_bypass] |= AD9517_CMOSDIV_BYPASS_1;
+	else
+		st->regs[reg_bypass] &= ~AD9517_CMOSDIV_BYPASS_1;
+
+	if (d2 == 1)
+		st->regs[reg_bypass] |= AD9517_CMOSDIV_BYPASS_2;
+	else
+		st->regs[reg_bypass] &= ~AD9517_CMOSDIV_BYPASS_2;
+
+	ret = ad9517_write(st->spi, reg_bypass, st->regs[reg_bypass]);
+	if (ret < 0)
+		return ret;
+
+	ret = ad9517_calc_divider_hi_lo(d1, &hi, &lo);
+	if (ret >= 0) {
+		st->regs[reg_div1] = (hi << 4) | (lo & 0xF);
+		ret = ad9517_write(st->spi, reg_div1, st->regs[reg_div1]);
+		if (ret < 0)
+			return ret;
+	}
+
+	ret = ad9517_calc_divider_hi_lo(d2, &hi, &lo);
+	if (ret >= 0) {
+		st->regs[reg_div2] = (hi << 4) | (lo & 0xF);
+		ret = ad9517_write(st->spi, reg_div2, st->regs[reg_div2]);
+		if (ret < 0)
+			return ret;
+	}
+
+	return 0;
+}
+
+static int ad9517_out0123_set_frequency(struct ad9517_state *st, int chan, int val)
+{
+	unsigned reg_bypass, reg_div1, reg_bypass2;
+	unsigned d1, hi, lo;
+	int ret;
+
+	switch (chan) {
+	case 0:
+	case 1:
+		reg_bypass = AD9517_PECLDIV0_3;
+		reg_div1 = AD9517_PECLDIV0_1;
+		reg_bypass2 = AD9517_PECLDIV0_2;
+		break;
+	case 2:
+	case 3:
+		reg_bypass = AD9517_PECLDIV1_3;
+		reg_div1 = AD9517_PECLDIV1_1;
+		reg_bypass2 = AD9517_PECLDIV1_2;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	if (val > st->div0123_freq) {
+		st->regs[reg_bypass] |= AD9517_PECLDIV_VCO_SEL;
+		return ad9517_write(st->spi, reg_bypass, st->regs[reg_bypass]);
+	} else {
+		st->regs[reg_bypass] &= ~AD9517_PECLDIV_VCO_SEL;
+		ret = ad9517_write(st->spi, reg_bypass, st->regs[reg_bypass]);
+		if (ret < 0)
+			return ret;
+	}
+
+	d1 = DIV_ROUND_CLOSEST(st->div0123_freq, val);
+	d1 = clamp_t(unsigned, d1, 1, 32);
+
+	if (d1 ==  1) {
+		st->regs[reg_bypass2] |= AD9517_PECLDIV_3_BP;
+	} else {
+		st->regs[reg_bypass2] &= ~AD9517_PECLDIV_3_BP;
+	}
+
+	ret = ad9517_write(st->spi, reg_bypass2, st->regs[reg_bypass2]);
+	if (ret < 0)
+		return ret;
+
+	ret = ad9517_calc_divider_hi_lo(d1, &hi, &lo);
+	if (ret >= 0) {
+		st->regs[reg_div1] = (hi << 4) | (lo & 0xF);
+		ret = ad9517_write(st->spi, reg_div1, st->regs[reg_div1]);
+		if (ret < 0)
+			return ret;
+	}
+
+	return 0;
+}
+
+static unsigned long ad9517_get_frequency(struct ad9517_state *st, int chan)
+{
+	unsigned long rate;
+	unsigned d1, d2;
+
+	switch (chan) {
+	case 0:
+	case 1:
+		if (st->regs[AD9517_PECLDIV0_3] & AD9517_PECLDIV_VCO_SEL) {
+			rate = st->vco_divin_freq;
+		} else {
+			if (st->regs[AD9517_PECLDIV0_2] & AD9517_PECLDIV_3_BP)
+				d1 = 1;
+			else
+				d1 = (st->regs[AD9517_PECLDIV0_1] & 0xF) +
+					(st->regs[AD9517_PECLDIV0_1] >> 4) + 2;
+
+			rate = st->div0123_freq / d1;
+		}
+		break;
+	case 2:
+	case 3:
+		if (st->regs[AD9517_PECLDIV1_3] & AD9517_PECLDIV_VCO_SEL) {
+			rate = st->vco_divin_freq;
+		} else {
+			if (st->regs[AD9517_PECLDIV1_2] & AD9517_PECLDIV_3_BP)
+				d1 = 1;
+			else
+				d1 = (st->regs[AD9517_PECLDIV1_1] & 0xF) +
+					(st->regs[AD9517_PECLDIV1_1] >> 4) + 2;
+
+			rate = st->div0123_freq / d1;
+
+		}
+		break;
+	case 4:
+	case 5:
+		if (st->regs[AD9517_CMOSDIV2_BYPASS] & AD9517_CMOSDIV_BYPASS_1)
+			d1 = 1;
+		else
+			d1 = (st->regs[AD9517_CMOSDIV2_1] & 0xF) +
+				(st->regs[AD9517_CMOSDIV2_1] >> 4) + 2;
+
+		if (st->regs[AD9517_CMOSDIV2_BYPASS] & AD9517_CMOSDIV_BYPASS_2)
+			d2 = 1;
+		else
+			d2 = (st->regs[AD9517_CMOSDIV2_2] & 0xF) +
+				(st->regs[AD9517_CMOSDIV2_2] >> 4) + 2;
+
+		rate = st->div0123_freq / (d1 * d2);
+
+		break;
+	case 6:
+	case 7:
+		if (st->regs[AD9517_CMOSDIV3_BYPASS] & AD9517_CMOSDIV_BYPASS_1)
+			d1 = 1;
+		else
+			d1 = (st->regs[AD9517_CMOSDIV3_1] & 0xF) +
+				(st->regs[AD9517_CMOSDIV3_1] >> 4) + 2;
+
+		if (st->regs[AD9517_CMOSDIV3_BYPASS] & AD9517_CMOSDIV_BYPASS_2)
+			d2 = 1;
+		else
+			d2 = (st->regs[AD9517_CMOSDIV3_2] & 0xF) +
+				(st->regs[AD9517_CMOSDIV3_2] >> 4) + 2;
+
+		rate = st->div0123_freq / (d1 * d2);
+
+		break;
+	}
+
+	return rate;
+}
+
+static int ad9517_out_enable(struct ad9517_state *st, int chan, int val)
+{
+	unsigned reg = output_pwrdwn_lut[chan][PWRDWN_REG];
+	int ret;
+
+	if (val)
+		st->regs[reg] &= ~output_pwrdwn_lut[chan][PWRDWN_MASK];
+	else
+		st->regs[reg] |= output_pwrdwn_lut[chan][PWRDWN_MASK];
+
+	ret = ad9517_write(st->spi, reg, st->regs[reg]);
+	if (ret < 0)
+		return ret;
+
+	return ad9517_write(st->spi, AD9517_TRANSFER, AD9517_TRANSFER_NOW);
+}
+
 static int ad9517_setup(struct ad9517_state *st)
 {
 	struct spi_device *spi = st->spi;
 	int ret, reg;
-	unsigned cal_delay_ms, d1, d2;
+	unsigned cal_delay_ms;
 	unsigned long pll_a_cnt, pll_b_cnt, pll_r_cnt, prescaler;
 	unsigned long vco_freq;
 	unsigned long vco_divin_freq;
 	unsigned long div0123_freq;
+	bool uses_vco = false;
+	bool uses_clkin = false;
+
+	gpiod_set_value(st->gpio_sync, 1);
 
 	/* Setup PLL */
 	for (reg = AD9517_PFD_CP; reg <= AD9517_PLL8; reg++) {
@@ -373,33 +640,51 @@ static int ad9517_setup(struct ad9517_state *st)
 
 	prescaler &= ~IS_FD;
 
-	vco_freq = (st->refin_freq / pll_r_cnt * (prescaler  *
-			pll_b_cnt + pll_a_cnt));
+	if (st->regs[AD9517_INPUT_CLKS] & AD9517_VCO_DIVIDER_SEL)
+		uses_vco = true;
+	else
+		uses_clkin = true;
 
-	/* tcal = 4400 * Rdiv * cal_div / Refin */
-	cal_delay_ms = (4400 * pll_r_cnt *
-		(2 << ((st->regs[AD9517_PLL3] >> 1) & 0x3))) /
-		(st->refin_freq / 1000);
+	if (st->regs[AD9517_INPUT_CLKS] & AD9517_VCO_DIVIDER_BP)
+		uses_clkin = true;
+	else
+		uses_vco = true;
 
-	msleep(cal_delay_ms);
+	if (uses_vco) {
+		if (st->refin_freq == 0) {
+			dev_err(&st->spi->dev, "Invalid or missing REFIN clock\n");
+			return -EINVAL;
+		}
+
+		vco_freq = (st->refin_freq / pll_r_cnt * (prescaler  *
+				pll_b_cnt + pll_a_cnt));
+
+		/* tcal = 4400 * Rdiv * cal_div / Refin */
+		cal_delay_ms = (4400 * pll_r_cnt *
+			(2 << ((st->regs[AD9517_PLL3] >> 1) & 0x3))) /
+			(st->refin_freq / 1000);
+
+		msleep(cal_delay_ms);
+	}
+
+	if (uses_clkin) {
+		if (st->clkin_freq == 0) {
+			dev_err(&st->spi->dev, "Invalid or missing CLKIN clock\n");
+			return -EINVAL;
+		}
+	}
 
 	/* Internal clock distribution */
 
 	if (st->regs[AD9517_INPUT_CLKS] & AD9517_VCO_DIVIDER_SEL) {
-		if (!vco_freq)
-			return -EINVAL;
 		vco_divin_freq = vco_freq;
 		st->vco_divin_clk_parent_name = "refclk";
 	} else {
-		if (!st->clkin_freq)
-			return -EINVAL;
 		vco_divin_freq = st->clkin_freq;
 		st->vco_divin_clk_parent_name = "clkin";
 	}
 
 	if (st->regs[AD9517_INPUT_CLKS] & AD9517_VCO_DIVIDER_BP) {
-		if (!st->clkin_freq)
-			return -EINVAL;
 		div0123_freq = st->clkin_freq;
 		st->div0123_clk_parent_name = "clkin";
 	} else {
@@ -412,23 +697,10 @@ static int ad9517_setup(struct ad9517_state *st)
 	/* 0..1 */
 
 	if (st->regs[AD9517_PECLDIV0_3] & AD9517_PECLDIV_VCO_SEL) {
-		st->output[OUT_0].freq =
-			st->output[OUT_1].freq =
-			vco_divin_freq;
 		st->output[OUT_0].parent_name =
 			st->output[OUT_1].parent_name =
 			st->vco_divin_clk_parent_name;
 	} else {
-		if (st->regs[AD9517_PECLDIV0_2] & AD9517_PECLDIV_3_BP)
-			d1 = 1;
-		else
-			d1 = (st->regs[AD9517_PECLDIV0_1] & 0xF) +
-				(st->regs[AD9517_PECLDIV0_1] >> 4) + 2;
-
-		st->output[OUT_0].freq =
-			st->output[OUT_1].freq =
-			div0123_freq / d1;
-
 		st->output[OUT_0].parent_name =
 			st->output[OUT_1].parent_name =
 			st->div0123_clk_parent_name;
@@ -437,23 +709,10 @@ static int ad9517_setup(struct ad9517_state *st)
 	/* 2..3 */
 
 	if (st->regs[AD9517_PECLDIV1_3] & AD9517_PECLDIV_VCO_SEL) {
-		st->output[OUT_2].freq =
-			st->output[OUT_3].freq =
-			vco_divin_freq;
 		st->output[OUT_2].parent_name =
 			st->output[OUT_3].parent_name =
 			st->vco_divin_clk_parent_name;
 	} else {
-		if (st->regs[AD9517_PECLDIV1_2] & AD9517_PECLDIV_3_BP)
-			d1 = 1;
-		else
-			d1 = (st->regs[AD9517_PECLDIV1_1] & 0xF) +
-				(st->regs[AD9517_PECLDIV1_1] >> 4) + 2;
-
-		st->output[OUT_2].freq =
-			st->output[OUT_3].freq =
-			div0123_freq / d1;
-
 		st->output[OUT_2].parent_name =
 			st->output[OUT_3].parent_name =
 			st->div0123_clk_parent_name;
@@ -461,47 +720,21 @@ static int ad9517_setup(struct ad9517_state *st)
 
 	/* 4..5 */
 
-	if (st->regs[AD9517_CMOSDIV2_BYPASS] & AD9517_CMOSDIV_BYPASS_1)
-		d1 = 1;
-	else
-		d1 = (st->regs[AD9517_CMOSDIV2_1] & 0xF) +
-			(st->regs[AD9517_CMOSDIV2_1] >> 4) + 2;
-
-	if (st->regs[AD9517_CMOSDIV2_BYPASS] & AD9517_CMOSDIV_BYPASS_2)
-		d2 = 1;
-	else
-		d2 = (st->regs[AD9517_CMOSDIV2_2] & 0xF) +
-			(st->regs[AD9517_CMOSDIV2_2] >> 4) + 2;
-
-	st->output[OUT_4].freq =
-		st->output[OUT_5].freq =
-		div0123_freq / (d1 * d2);
-
 	st->output[OUT_4].parent_name =
 		st->output[OUT_5].parent_name =
 		st->div0123_clk_parent_name;
 
 	/* 6..7 */
 
-	if (st->regs[AD9517_CMOSDIV3_BYPASS] & AD9517_CMOSDIV_BYPASS_1)
-		d1 = 1;
-	else
-		d1 = (st->regs[AD9517_CMOSDIV3_1] & 0xF) +
-			(st->regs[AD9517_CMOSDIV3_1] >> 4) + 2;
-
-	if (st->regs[AD9517_CMOSDIV3_BYPASS] & AD9517_CMOSDIV_BYPASS_2)
-		d2 = 1;
-	else
-		d2 = (st->regs[AD9517_CMOSDIV3_2] & 0xF) +
-			(st->regs[AD9517_CMOSDIV3_2] >> 4) + 2;
-
-	st->output[OUT_6].freq =
-		st->output[OUT_7].freq =
-		div0123_freq / (d1 * d2);
-
 	st->output[OUT_6].parent_name =
 		st->output[OUT_7].parent_name =
 		st->div0123_clk_parent_name;
+
+
+	st->div0123_freq = div0123_freq;
+	st->vco_divin_freq = vco_divin_freq;
+
+	gpiod_set_value(st->gpio_sync, 0);
 
 	return 0;
 }
@@ -509,17 +742,88 @@ static int ad9517_setup(struct ad9517_state *st)
 static unsigned long ad9517_recalc_rate(struct clk_hw *hw,
 		unsigned long parent_rate)
 {
-	return to_ad9517_clk_output(hw)->freq;
+	return ad9517_get_frequency(to_ad9517_clk_output(hw)->st,
+				    to_ad9517_clk_output(hw)->num);
 }
 
 static int ad9517_is_enabled(struct clk_hw *hw)
 {
-	return to_ad9517_clk_output(hw)->is_enabled;
+	unsigned out = to_ad9517_clk_output(hw)->num;
+
+	return !(to_ad9517_clk_output(hw)->st->regs[
+			output_pwrdwn_lut[out][PWRDWN_REG]] &
+			output_pwrdwn_lut[out][PWRDWN_MASK]);
+}
+
+static long ad9517_clk_round_rate(struct clk_hw *hw, unsigned long rate,
+				  unsigned long *prate)
+{
+	struct ad9517_state *st = to_ad9517_clk_output(hw)->st;
+	unsigned num = to_ad9517_clk_output(hw)->num;
+	long rrate;
+	unsigned d1, d2;
+
+	switch (num) {
+	case 0 ... 3:
+		if (rate > st->div0123_freq) {
+			rrate = st->vco_divin_freq;
+		} else {
+			d1 = DIV_ROUND_CLOSEST(st->div0123_freq, rate);
+			d1 = clamp_t(unsigned, d1, 1, 32);
+			rrate = st->div0123_freq / d1;
+		}
+		break;
+	case 4 ... 7:
+		ad9517_calc_d12_dividers(st->div0123_freq, rate, &d1, &d2);
+		rrate = st->div0123_freq / (d1 * d2);
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	return rrate;
+}
+
+static int ad9517_clk_set_rate(struct clk_hw *hw, unsigned long rate,
+			       unsigned long prate)
+{
+	struct ad9517_state *st = to_ad9517_clk_output(hw)->st;
+	unsigned num = to_ad9517_clk_output(hw)->num;
+	int ret;
+
+	switch (num) {
+	case 0 ... 3:
+		ret = ad9517_out0123_set_frequency(st, num, rate);
+		break;
+	case 4 ... 7:
+		ret = ad9517_out4567_set_frequency(st, num, rate);
+		break;
+	}
+
+	ad9517_write(st->spi, AD9517_TRANSFER, AD9517_TRANSFER_NOW);
+
+	return ret;
+}
+
+static int ad9517_clk_prepare(struct clk_hw *hw)
+{
+	struct ad9517_state *st = to_ad9517_clk_output(hw)->st;
+	return ad9517_out_enable(st, to_ad9517_clk_output(hw)->num, 1);
+}
+
+static void ad9517_clk_unprepare(struct clk_hw *hw)
+{
+	struct ad9517_state *st = to_ad9517_clk_output(hw)->st;
+	ad9517_out_enable(st, to_ad9517_clk_output(hw)->num, 0);
 }
 
 static const struct clk_ops ad9517_clk_ops = {
 	.recalc_rate = ad9517_recalc_rate,
 	.is_enabled = ad9517_is_enabled,
+	.set_rate = ad9517_clk_set_rate,
+	.round_rate = ad9517_clk_round_rate,
+	.prepare = ad9517_clk_prepare,
+	.unprepare = ad9517_clk_unprepare,
 };
 
 static struct clk *ad9517_clk_register(struct ad9517_state *st, unsigned num)
@@ -538,9 +842,10 @@ static struct clk *ad9517_clk_register(struct ad9517_state *st, unsigned num)
 
 	output->hw.init = &init;
 	output->st = st;
+	output->num = num;
 
 	/* register the clock */
-	clk = clk_register(&st->spi->dev, &output->hw);
+	clk = devm_clk_register(&st->spi->dev, &output->hw);
 	st->clk_data.clks[num] = clk;
 
 	return clk;
@@ -582,18 +887,53 @@ static int ad9517_read_raw(struct iio_dev *indio_dev,
 
 	switch (m) {
 	case IIO_CHAN_INFO_RAW:
-		*val = st->output[chan->channel].is_enabled;
+		*val = !(st->regs[output_pwrdwn_lut[chan->channel][PWRDWN_REG]] &
+			output_pwrdwn_lut[chan->channel][PWRDWN_MASK]);
+
 		return IIO_VAL_INT;
 	case IIO_CHAN_INFO_FREQUENCY:
-		*val = st->output[chan->channel].freq;
+		*val = (int) ad9517_get_frequency(st, chan->channel);
 		return IIO_VAL_INT;
 	default:
 		return -EINVAL;
 	}
 };
 
+static int ad9517_write_raw(struct iio_dev *indio_dev,
+			    struct iio_chan_spec const *chan,
+			    int val,
+			    int val2,
+			    long m)
+{
+	struct ad9517_state *st = iio_priv(indio_dev);
+	int ret;
+
+	switch (m) {
+	case IIO_CHAN_INFO_RAW:
+		ad9517_out_enable(st, chan->channel, val);
+		break;
+	case IIO_CHAN_INFO_FREQUENCY:
+		switch (chan->channel) {
+		case 0 ... 3:
+			ret = ad9517_out0123_set_frequency(st, chan->channel, val);
+			break;
+		case 4 ... 7:
+			ret = ad9517_out4567_set_frequency(st, chan->channel, val);
+			break;
+		}
+
+		ad9517_write(st->spi, AD9517_TRANSFER, AD9517_TRANSFER_NOW);
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	return ret;
+}
+
 static const struct iio_info ad9517_info = {
 	.read_raw = &ad9517_read_raw,
+	.write_raw = ad9517_write_raw,
 	.debugfs_reg_access = &ad9517_reg_access,
 	.driver_module = THIS_MODULE,
 };
@@ -628,11 +968,21 @@ static int ad9517_probe(struct spi_device *spi)
 	bool spi3wire = of_property_read_bool(
 			spi->dev.of_node, "adi,spi-3wire-enable");
 
-	indio_dev = iio_device_alloc(sizeof(*st));
+	indio_dev = devm_iio_device_alloc(&spi->dev, sizeof(*st));
 	if (indio_dev == NULL)
 		return -ENOMEM;
 
 	st = iio_priv(indio_dev);
+
+	st->gpio_reset = devm_gpiod_get_optional(&spi->dev, "reset",
+	    GPIOD_OUT_HIGH);
+	if (st->gpio_reset) {
+		udelay(10);
+		gpiod_set_value(st->gpio_reset, 0);
+	}
+
+	st->gpio_sync = devm_gpiod_get_optional(&spi->dev, "sync",
+	    GPIOD_OUT_HIGH);
 
 	conf = AD9517_LONG_INSTR |
 		((spi->mode & SPI_3WIRE || spi3wire) ? 0 : AD9517_SDO_ACTIVE);
@@ -668,7 +1018,7 @@ static int ad9517_probe(struct spi_device *spi)
 				"request_firmware() failed with %i\n", ret);
 			return ret;
 		}
-		ad9517_parse_firmware(st, (u8 *) fw->data, fw->size);
+		ad9517_parse_firmware(st, fw->data, fw->size);
 		release_firmware(fw);
 	} else {
 		ret = ad9517_parse_pdata(st, pdata);
@@ -680,29 +1030,30 @@ static int ad9517_probe(struct spi_device *spi)
 	}
 
 	st->spi = spi;
-	ref_clk = clk_get(&spi->dev, "refclk");
-	clkin = clk_get(&spi->dev, "clkin");
 
-	if (IS_ERR(ref_clk) && IS_ERR(clkin)) {
-		ret = PTR_ERR(ref_clk);
-		dev_err(&spi->dev, "failed getting clock (%d)\n", ret);
-		goto out;
-	}
-
-
+	ref_clk = devm_clk_get(&spi->dev, "refclk");
 	if (IS_ERR(ref_clk)) {
 		ret = PTR_ERR(ref_clk);
-		dev_warn(&spi->dev, "failed getting clock (%d)\n", ret);
+		if (ret != -ENOENT) {
+			dev_err(&spi->dev, "Failed getting REFIN clock (%d)\n", ret);
+			return ret;
+		}
 	} else {
 		st->refin_freq = clk_get_rate(ref_clk);
+		clk_prepare_enable(ref_clk);
+
 	}
 
+	clkin = devm_clk_get(&spi->dev, "clkin");
 	if (IS_ERR(clkin)) {
 		ret = PTR_ERR(clkin);
-		dev_warn(&spi->dev, "failed getting clock (%d)\n", ret);
-		goto out;
+		if (ret != -ENOENT) {
+			dev_err(&spi->dev, "Failed getting CLK clock (%d)\n", ret);
+			return ret;
+		}
 	} else {
 		st->clkin_freq = clk_get_rate(clkin);
+		clk_prepare_enable(clkin);
 	}
 
 	ret = ad9517_setup(st);
@@ -714,15 +1065,11 @@ static int ad9517_probe(struct spi_device *spi)
 					 NUM_OUTPUTS, GFP_KERNEL);
 	if (!st->clk_data.clks) {
 		dev_err(&st->spi->dev, "could not allocate memory\n");
-		ret = -ENOMEM;
-		goto out;
+		return -ENOMEM;
 	}
 	st->clk_data.clk_num = NUM_OUTPUTS;
 
 	for (out = 0; out < NUM_OUTPUTS; out++) {
-		st->output[out].is_enabled =
-			!(st->regs[output_pwrdwn_lut[out][PWRDWN_REG]] &
-			output_pwrdwn_lut[out][PWRDWN_MASK]);
 		clk = ad9517_clk_register(st, out);
 		if (IS_ERR(clk))
 			return PTR_ERR(clk);
@@ -740,14 +1087,14 @@ static int ad9517_probe(struct spi_device *spi)
 
 	ret = iio_device_register(indio_dev);
 	if (ret)
-		goto out;
+		goto err_of_clk_del_provider;
 
+	spi_set_drvdata(spi, indio_dev);
 
-	dev_info(&spi->dev, "probed\n");
 	return 0;
 
-out:
-	spi_set_drvdata(spi, NULL);
+err_of_clk_del_provider:
+	of_clk_del_provider(spi->dev.of_node);
 	return ret;
 }
 
@@ -756,9 +1103,7 @@ static int ad9517_remove(struct spi_device *spi)
 	struct iio_dev *indio_dev = spi_get_drvdata(spi);
 
 	iio_device_unregister(indio_dev);
-	iio_device_free(indio_dev);
-
-	spi_set_drvdata(spi, NULL);
+	of_clk_del_provider(spi->dev.of_node);
 
 	return 0;
 }

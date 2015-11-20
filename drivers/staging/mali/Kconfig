@@ -13,10 +13,18 @@ choice
 config ARM_MALI_R5P1_01REL0
 	bool "r5p1-01rel0"
 
-config ARM_MALI_R5P2_00REL0
-	bool "r5p2-00rel0"
+#config ARM_MALI_R5P2_00REL0
+#	bool "r5p2-00rel0"
 
 endchoice
+
+# Setup default options
+config MALI400
+	tristate
+	default y
+
+config MALI_DT
+	def_bool y
 
 # Source different driver versions
 if ARM_MALI_R5P1_01REL0

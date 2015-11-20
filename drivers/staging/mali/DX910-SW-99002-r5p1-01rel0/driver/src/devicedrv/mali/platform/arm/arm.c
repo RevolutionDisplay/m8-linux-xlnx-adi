@@ -41,7 +41,7 @@ static void mali_write_phys(u32 phys_addr, u32 value);
 #ifndef CONFIG_MALI_DT
 static void mali_platform_device_release(struct device *device);
 
-#if defined(CONFIG_ARCH_VEXPRESS)
+#if defined(CONFIG_ARCH_VEXPRESS) && !(defined(CONFIG_ARCH_ZYNQ) || defined(CONFIG_ARCH_ZYNQMP))
 
 #if defined(CONFIG_ARM64)
 /* Juno + Mali-450 MP6 in V7 FPGA */
@@ -84,7 +84,7 @@ static struct mali_gpu_device_data mali_gpu_data = {
 #ifndef CONFIG_MALI_DT
 	.pmu_switch_delay = 0xFF, /* do not have to be this high on FPGA, but it is good for testing to have a delay */
 	.max_job_runtime = 60000, /* 60 seconds */
-#if defined(CONFIG_ARCH_VEXPRESS)
+#if defined(CONFIG_ARCH_VEXPRESS) && !(defined(CONFIG_ARCH_ZYNQ) || defined(CONFIG_ARCH_ZYNQMP))
 	.shared_mem_size = 256 * 1024 * 1024, /* 256MB */
 #endif
 #endif
@@ -93,6 +93,10 @@ static struct mali_gpu_device_data mali_gpu_data = {
 	.dedicated_mem_start = 0x80000000, /* Physical start address (use 0xD0000000 for old indirect setup) */
 	.dedicated_mem_size = 0x10000000, /* 256MB */
 #endif
+#if defined(CONFIG_ARCH_ZYNQ) || defined(CONFIG_ARCH_ZYNQMP)
+	.fb_start = 0x00000000,
+	.fb_size = 0xfffff000,
+#else
 #if defined(CONFIG_ARM64)
 	.fb_start = 0x5f000000,
 	.fb_size = 0x91000000,
@@ -100,6 +104,7 @@ static struct mali_gpu_device_data mali_gpu_data = {
 	.fb_start = 0xe0000000,
 	.fb_size = 0x01000000,
 #endif
+#endif /* !defined(CONFIG_ARCH_ZYNQ) && !defined(CONFIG_ARCH_ZYNQMP) */
 	.control_interval = 1000, /* 1000ms */
 	.utilization_callback = mali_gpu_utilization_callback,
 	.get_clock_info = NULL,
@@ -132,7 +137,7 @@ int mali_platform_device_register(void)
 	MALI_DEBUG_PRINT(4, ("mali_platform_device_register() called\n"));
 
 	/* Detect present Mali GPU and connect the correct resources to the device */
-#if defined(CONFIG_ARCH_VEXPRESS)
+#if defined(CONFIG_ARCH_VEXPRESS) && !(defined(CONFIG_ARCH_ZYNQ) || defined(CONFIG_ARCH_ZYNQMP))
 
 #if defined(CONFIG_ARM64)
 	if (mali_read_phys(0x6F000000) == 0x40601450) {
@@ -237,7 +242,7 @@ int mali_platform_device_init(struct platform_device *device)
 #endif
 
 	/* Detect present Mali GPU and connect the correct resources to the device */
-#if defined(CONFIG_ARCH_VEXPRESS)
+#if defined(CONFIG_ARCH_VEXPRESS) && !(defined(CONFIG_ARCH_ZYNQ) || defined(CONFIG_ARCH_ZYNQMP))
 
 #if defined(CONFIG_ARM64)
 	if (mali_read_phys(0x6F000000) == 0x40601450) {
@@ -275,6 +280,11 @@ int mali_platform_device_init(struct platform_device *device)
 			mali_write_phys(0xC0010020, 0xA); /* Enable direct memory mapping for FPGA */
 		}
 	}
+#elif defined(CONFIG_ARCH_ZYNQ) || defined(CONFIG_ARCH_ZYNQMP)
+
+	MALI_DEBUG_PRINT(4, ("Registering Zynq/ZynqMP Mali-400 device\n"));
+	num_pp_cores = 2;
+
 #endif
 
 	err = platform_device_add_data(device, &mali_gpu_data, sizeof(mali_gpu_data));

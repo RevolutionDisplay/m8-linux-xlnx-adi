@@ -3095,7 +3095,6 @@ struct ad9361_phy_platform_data {
 	bool			ensm_pin_pulse_mode;
 	bool			ensm_pin_ctrl;
 	bool			debug_mode;
-	bool			tdd_use_fdd_tables;
 	bool			tdd_use_dual_synth;
 	bool			tdd_skip_vco_cal;
 	bool			use_ext_rx_lo;
@@ -3113,6 +3112,8 @@ struct ad9361_phy_platform_data {
 	u32			dcxo_fine;
 	u32			rf_rx_input_sel;
 	u32			rf_tx_output_sel;
+	u32			rx1tx1_mode_use_rx_num;
+	u32			rx1tx1_mode_use_tx_num;
 	unsigned long		rx_path_clks[NUM_RX_CLOCKS];
 	unsigned long		tx_path_clks[NUM_TX_CLOCKS];
 	u32			trx_synth_max_fref;
@@ -3295,7 +3296,7 @@ struct ad9361_rf_phy {
 	struct refclk_scale	clk_priv[NUM_AD9361_CLKS];
 	struct clk_onecell_data	clk_data;
 	struct ad9361_phy_platform_data *pdata;
-	struct ad9361_debugfs_entry debugfs_entry[173];
+	struct ad9361_debugfs_entry debugfs_entry[175];
 	struct bin_attribute 	bin;
 	struct iio_dev 		*indio_dev;
 	struct work_struct 	work;
@@ -3313,6 +3314,10 @@ struct ad9361_rf_phy {
 	bool 			manual_tx_quad_cal_en;
 	u64			last_tx_quad_cal_freq;
 	u32			last_tx_quad_cal_phase;
+	u64			current_tx_lo_freq;
+	u64			current_rx_lo_freq;
+	bool			current_tx_use_tdd_table;
+	bool			current_rx_use_tdd_table;
 	unsigned long		flags;
 	unsigned long		cal_threshold_freq;
 	u32			current_rx_bw_Hz;
@@ -3338,6 +3343,9 @@ struct ad9361_rf_phy {
 	bool			txmon_tdd_en;
 	u16 			auxdac1_value;
 	u16 			auxdac2_value;
+	u32			tx1_atten_cached;
+	u32			tx2_atten_cached;
+
 	struct ad9361_fastlock	fastlock;
 };
 
@@ -3362,7 +3370,7 @@ int ad9361_set_trx_clock_chain(struct ad9361_rf_phy *phy,
 				      unsigned long *tx_path_clks);
 int ad9361_dig_tune(struct ad9361_rf_phy *phy, unsigned long max_freq,
 			   enum dig_tune_flags flags);
-
+int ad9361_tx_mute(struct ad9361_rf_phy *phy, u32 state);
 
 #endif
 
