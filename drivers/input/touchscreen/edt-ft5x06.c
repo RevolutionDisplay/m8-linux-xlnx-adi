@@ -812,7 +812,8 @@ static int edt_ft5x06_ts_identify(struct i2c_client *client,
 			break;
 
 		/* Twak has a min of 5ms, empirically this needs to be at least 10ms */
-		msleep(10);
+		/* making it 100ms as this seems to be more reliable */
+		msleep(100);
 	}
 	if (error)
 		return error;
